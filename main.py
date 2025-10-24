@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 # Define a local cache folder to ensure the model is saved consistently
 MODEL_CACHE_PATH = '.model_cache'
-PINECONE_INDEX_NAME = 'care'
+# --- THIS IS THE FIX ---
+PINECONE_INDEX_NAME = 'care-mini'
 
 # Create a directory for usage tracking if it doesn't exist
 USAGE_TRACKING_DIR = "usage_tracking"
@@ -236,7 +237,7 @@ def get_usage_statistics():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown events for the FastAPI app."""
-    logger.info("Starting C.A.R.E. Backend with Pinecone...")
+    logger.info(f"Starting C.A.R.E. Backend with Pinecone index: '{PINECONE_INDEX_NAME}'...")
     
     # Initialize components on startup
     try:
@@ -251,11 +252,12 @@ async def lifespan(app: FastAPI):
             google_api_key=gemini_api_key
         )
 
-        # 2. Initialize the embedding model with the same cache folder used in ingestion
+        # 2. Initialize the embedding model
         logger.info(f"Loading embedding model from cache: {MODEL_CACHE_PATH}")
         try:
+            # --- THIS IS THE FIX ---
             embeddings = HuggingFaceEmbeddings(
-                model_name="BAAI/bge-m3",
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
                 cache_folder=MODEL_CACHE_PATH,
                 model_kwargs={'device': 'cpu'},
                 encode_kwargs={'normalize_embeddings': True}
@@ -263,10 +265,10 @@ async def lifespan(app: FastAPI):
             logger.info("Embedding model loaded successfully from cache.")
         except Exception as e:
             logger.error(f"Failed to load embedding model from cache: {e}")
-            # Fallback to a different approach if cache loading fails
             logger.info("Attempting to load embedding model without cache...")
+            # --- THIS IS THE FIX ---
             embeddings = HuggingFaceEmbeddings(
-                model_name="BAAI/bge-m3",
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
                 model_kwargs={'device': 'cpu'},
                 encode_kwargs={'normalize_embeddings': True}
             )
@@ -274,37 +276,39 @@ async def lifespan(app: FastAPI):
         # 3. Connect to Pinecone
         logger.info(f"Connecting to Pinecone index: {PINECONE_INDEX_NAME}")
         
-        # Initialize Pinecone
         pinecone_api_key = os.environ.get("PINECONE_API_KEY")
         if not pinecone_api_key:
             raise ValueError("PINECONE_API_KEY not found in .env file.")
             
         pc = pinecone.Pinecone(api_key=pinecone_api_key)
         
-        # Check if index exists
         if PINECONE_INDEX_NAME not in pc.list_indexes().names():
             logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' not found. Please run ingest_pinecone.py first.")
             raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' not found")
         
-        # Create the vector store
         vector_store = PineconeVectorStore(
             index_name=PINECONE_INDEX_NAME,
             embedding=embeddings,
-            text_key="text_content"  # <-- ***THIS IS THE FIX***
+            text_key="text_content"
         )
         
-        # Check document count
         index = pc.Index(PINECONE_INDEX_NAME)
         stats = index.describe_index_stats()
         doc_count = stats.get('total_vector_count', 0)
+        
+        # --- Check dimension ---
+        if stats.get('dimension') != 384:
+            logger.error(f"FATAL: Pinecone index dimension is {stats.get('dimension')}, but model requires 384.")
+            logger.error("Please delete the index and recreate it with dimension 384, then run ingest_pinecone.py.")
+            raise ValueError(f"Incorrect Pinecone dimension: expected 384, got {stats.get('dimension')}")
+            
         logger.info(f"Connected to Pinecone with {doc_count} documents")
         
         if doc_count == 0:
-            logger.error("Pinecone index shows 0 documents! Please run ingest_pinecone.py.")
+            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' shows 0 documents! Please run ingest_pinecone.py.")
         
         retriever = vector_store.as_retriever(search_kwargs={"k": 5})
         
-        # Store vector_store for usage statistics
         app_state["vector_store"] = vector_store
 
         # 4. Define the improved RAG prompt template
@@ -444,13 +448,10 @@ async def lifespan(app: FastAPI):
             "required": ["primary_diagnosis", "differential_diagnoses", "clinical_recommendations"]
         }
 
-        # 6. Chain it all together using LangChain Expression Language (LCEL)
+        # 6. Chain it all together
         structured_llm = llm.with_structured_output(output_schema)
-
-        # Create a RunnableLambda for the format_docs function
         format_docs_lambda = RunnableLambda(lambda docs: "\n\n---\n\n".join([d.page_content for d in docs]))
 
-        # Custom retriever that tracks document usage
         def tracked_retriever_func(query):
             logger.info(f"Retrieving documents for query: {query[:100]}...")
             try:
@@ -459,18 +460,15 @@ async def lifespan(app: FastAPI):
                 
                 query_id = str(uuid.uuid4())
                 app_state["last_query_id"] = query_id
-                app_state["last_retrieved_docs"] = docs  # Store for debugging
+                app_state["last_retrieved_docs"] = docs
                 track_document_usage(docs, query_id)
                 return docs
             except Exception as e:
                 logger.error(f"Error during document retrieval: {e}")
-                # Return empty list if retrieval fails
                 return []
         
-        # Create a RunnableLambda for the tracked retriever
         tracked_retriever_lambda = RunnableLambda(tracked_retriever_func)
 
-        # Build the RAG chain using RunnableParallel and RunnableLambda
         rag_chain = (
             RunnableParallel(
                 {
@@ -488,7 +486,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize RAG chain: {e}", exc_info=True)
     
-    yield  # Application runs here
+    yield
     
     logger.info("Shutting down C.A.R.E. Backend...")
     app_state.clear()
@@ -532,11 +530,9 @@ async def analyze_report(request: ReportRequest):
         response = await rag_chain.ainvoke(request.report_text)
         logger.info("Successfully received response from RAG chain.")
         
-        # Include query ID in response for tracking
         query_id = app_state.get("last_query_id", "unknown")
         retrieved_docs = app_state.get("last_retrieved_docs", [])
         
-        # Create a new response object that includes the query_id and retrieved documents
         result = {
             "analysis": response,
             "query_id": query_id,
@@ -569,10 +565,8 @@ async def clinical_analysis(request: ReportRequest):
         logger.info(f"Response type: {type(response)}")
         logger.info(f"Response: {response}")
         
-        # Handle the response which might be a list or dictionary
         if isinstance(response, list):
             logger.info("Response is a list, attempting to extract data...")
-            # If it's a list, try to extract the first item or create a default structure
             if len(response) > 0:
                 response_data = response[0] if isinstance(response[0], dict) else {}
                 logger.info(f"Extracted data from list: {response_data}")
@@ -582,7 +576,6 @@ async def clinical_analysis(request: ReportRequest):
         else:
             response_data = response
         
-        # Ensure we have the required fields
         if not response_data:
             response_data = {
                 "primary_diagnosis": {
@@ -608,7 +601,6 @@ async def clinical_analysis(request: ReportRequest):
                 "clinical_recommendations": ["Please consult with a healthcare professional for proper diagnosis"]
             }
         
-        # Format the response for frontend consumption
         result = {
             "success": True,
             "data": {
@@ -654,7 +646,6 @@ async def get_online_resources(request: ResourceRequest):
         }
     except Exception as e:
         logger.error(f"Error fetching online resources: {e}", exc_info=True)
-        # Return fallback resources even in case of error
         fallback = create_fallback_resources(request.disease_name)
         return {
             "success": True,
@@ -673,24 +664,19 @@ async def analyze_file(file: UploadFile = File(...)):
     if "rag_chain" not in app_state:
         raise HTTPException(status_code=503, detail="RAG chain is not available. The service might be starting up or has encountered an error.")
     
-    # Check file type
     file_type = file.content_type
     if file_type not in ["application/pdf", "image/png", "image/jpeg", "image/jpg", "image/tiff"]:
         raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a PDF or image file.")
     
-    # Save the uploaded file to a temporary location
     import tempfile
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         try:
-            # Write the uploaded file to the temporary file
             content = await file.read()
             temp_file.write(content)
             temp_file_path = temp_file.name
             
-            # Extract text based on file type
             extracted_text = ""
             if file_type == "application/pdf":
-                # Extract text from PDF
                 import pdfplumber
                 with pdfplumber.open(temp_file_path) as pdf:
                     for page in pdf.pages:
@@ -698,27 +684,22 @@ async def analyze_file(file: UploadFile = File(...)):
                         if page_text:
                             extracted_text += page_text + "\n"
             elif file_type.startswith("image/"):
-                # Extract text from image using OCR
                 from PIL import Image
                 import pytesseract
                 image = Image.open(temp_file_path)
                 extracted_text = pytesseract.image_to_string(image)
             
-            # Check if text was extracted
             if not extracted_text or len(extracted_text.strip()) < 20:
                 raise HTTPException(status_code=400, detail="Could not extract sufficient text from the uploaded file. Please ensure the file contains readable text.")
             
-            # Process the extracted text through the RAG chain
             logger.info("Invoking RAG chain for file analysis...")
             rag_chain = app_state["rag_chain"]
             response = await rag_chain.ainvoke(extracted_text)
             logger.info("Successfully received response from RAG chain.")
             
-            # Include query ID in response for tracking
             query_id = app_state.get("last_query_id", "unknown")
             retrieved_docs = app_state.get("last_retrieved_docs", [])
             
-            # Create a new response object that includes the query_id and retrieved documents
             result = {
                 "success": True,
                 "data": {
@@ -745,7 +726,6 @@ async def analyze_file(file: UploadFile = File(...)):
             logger.error(f"Error during file analysis: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"An error occurred while processing the file: {str(e)}")
         finally:
-            # Clean up the temporary file
             if os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 
@@ -763,7 +743,6 @@ async def get_recent_queries(limit: int = 10):
     """Get information about recent queries and their retrieved documents."""
     usage_files = [f for f in os.listdir(USAGE_TRACKING_DIR) if f.endswith(".json")]
     
-    # Sort by modification time (newest first)
     usage_files.sort(key=lambda x: os.path.getmtime(f"{USAGE_TRACKING_DIR}/{x}"), reverse=True)
     
     recent_queries = []
@@ -778,36 +757,28 @@ async def get_recent_queries(limit: int = 10):
 async def debug_vector_store():
     """Debug endpoint to check the vector store."""
     try:
-        # Check Pinecone connection
         pc = pinecone.Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
         index = pc.Index(PINECONE_INDEX_NAME)
         stats = index.describe_index_stats()
 
-        # Extract only serializable data from stats, avoiding complex objects
         serializable_stats = {}
         for key in ["dimension", "index_fullness", "metric", "total_vector_count", "vector_type"]:
             value = stats.get(key)
-            # Only include basic serializable types
             if isinstance(value, (str, int, float, bool, type(None))):
                 serializable_stats[key] = value
 
-        # Handle namespaces separately - extract only basic info
         namespaces = stats.get("namespaces", {})
         if isinstance(namespaces, dict):
             namespace_info = {}
             for ns_name, ns_data in namespaces.items():
                 if isinstance(ns_data, dict):
-                    # Only extract vector_count which should be numeric
                     vector_count = ns_data.get("vector_count")
                     if isinstance(vector_count, (int, float)):
                         namespace_info[ns_name] = {"vector_count": vector_count}
             serializable_stats["namespaces"] = namespace_info
 
-        # Get a sample of documents
         sample_docs = []
         if stats.get('total_vector_count', 0) > 0:
-            # For Pinecone, we need to fetch by ID
-            # Since we don't have IDs, we'll just return the stats
             sample_docs = [{"info": "Pinecone doesn't support random sampling without IDs"}]
 
         return {
@@ -836,10 +807,8 @@ async def debug_retrieval(query: str = "chest pain"):
         }
         
         for doc in docs:
-            # Extract only serializable metadata
             serializable_metadata = {}
             for key, value in doc.metadata.items():
-                # Skip non-serializable items
                 if isinstance(value, (str, int, float, bool, list, dict, type(None))):
                     serializable_metadata[key] = value
             
