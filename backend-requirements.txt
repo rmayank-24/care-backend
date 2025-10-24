@@ -4,6 +4,7 @@
 fastapi==0.120.0
 uvicorn==0.38.0
 python-dotenv==1.1.1
+python-multipart==0.0.20 # <-- THIS IS THE FIX
 
 # LangChain & AI
 langchain==0.3.27
