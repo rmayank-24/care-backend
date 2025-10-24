@@ -1,0 +1,96 @@
+{
+  "timestamp": "2025-10-11T18:35:38.707717",
+  "base_url": "http://localhost:8000",
+  "results": [
+    {
+      "test": "health_check",
+      "status": "passed",
+      "response": {
+        "status": "healthy",
+        "timestamp": "2025-10-11T13:05:32.233850",
+        "models": {
+          "embedding": "BAAI/bge-m3",
+          "llm": "microsoft/BioGPT-Large"
+        }
+      }
+    },
+    {
+      "test": "analyze_report",
+      "results": [
+        {
+          "test_case": "Respiratory symptoms",
+          "status": "passed",
+          "conditions_found": 0
+        },
+        {
+          "test_case": "Diabetes symptoms",
+          "status": "passed",
+          "conditions_found": 0
+        },
+        {
+          "test_case": "Cardiac symptoms",
+          "status": "passed",
+          "conditions_found": 0
+        }
+      ]
+    },
+    {
+      "test": "chat",
+      "conversation_id": "test_conv_1760187931",
+      "results": [
+        {
+          "question": "What are the early symptoms of diabetes?",
+          "status": "passed",
+          "response_length": 45
+        },
+        {
+          "question": "How is pneumonia diagnosed?",
+          "status": "passed",
+          "response_length": 45
+        },
+        {
+          "question": "What treatments are available for hypertension?",
+          "status": "passed",
+          "response_length": 45
+        },
+        {
+          "question": "Can you explain the difference between Type 1 and ",
+          "status": "passed",
+          "response_length": 45
+        },
+        {
+          "question": "What preventive measures can be taken against hear",
+          "status": "passed",
+          "response_length": 45
+        }
+      ]
+    },
+    {
+      "test": "error_handling",
+      "results": [
+        {
+          "test_case": "Empty report",
+          "status": "passed"
+        },
+        {
+          "test_case": "Invalid conversation ID",
+          "status": "passed"
+        },
+        {
+          "test_case": "Too long report",
+          "status": "passed"
+        }
+      ]
+    },
+    {
+      "test": "performance",
+      "single_request_time": 2.203042984008789,
+      "concurrent_time": 2.363546848297119,
+      "concurrent_success_rate": 1.0
+    }
+  ],
+  "summary": {
+    "passed": 12,
+    "failed": 1
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "timestamp": "2025-10-11T18:25:41.644895",
+  "base_url": "http://localhost:8000",
+  "results": [
+    {
+      "test": "health_check",
+      "status": "failed",
+      "error": "All connection attempts failed"
+    },
+    {
+      "test": "analyze_report",
+      "results": [
+        {
+          "test_case": "Respiratory symptoms",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "test_case": "Diabetes symptoms",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "test_case": "Cardiac symptoms",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        }
+      ]
+    },
+    {
+      "test": "chat",
+      "conversation_id": "test_conv_1760187327",
+      "results": [
+        {
+          "question": "What are the early symptoms of diabetes?",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "question": "How is pneumonia diagnosed?",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "question": "What treatments are available for hypertension?",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "question": "Can you explain the difference between Type 1 and ",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "question": "What preventive measures can be taken against hear",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        }
+      ]
+    },
+    {
+      "test": "error_handling",
+      "results": [
+        {
+          "test_case": "Empty report",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "test_case": "Invalid conversation ID",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        },
+        {
+          "test_case": "Too long report",
+          "status": "failed",
+          "error": "All connection attempts failed"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 13
+  }
+}

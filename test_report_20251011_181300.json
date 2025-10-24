@@ -1,0 +1,96 @@
+{
+  "timestamp": "2025-10-11T18:13:00.318424",
+  "base_url": "http://localhost:8000",
+  "results": [
+    {
+      "test": "health_check",
+      "status": "passed",
+      "response": {
+        "status": "healthy",
+        "timestamp": "2025-10-11T12:42:40.033908",
+        "models": {
+          "embedding": "BAAI/bge-m3",
+          "llm": "microsoft/BioGPT-Large"
+        }
+      }
+    },
+    {
+      "test": "analyze_report",
+      "results": [
+        {
+          "test_case": "Respiratory symptoms",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "test_case": "Diabetes symptoms",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "test_case": "Cardiac symptoms",
+          "status": "failed",
+          "error": ""
+        }
+      ]
+    },
+    {
+      "test": "chat",
+      "conversation_id": "test_conv_1760186559",
+      "results": [
+        {
+          "question": "What are the early symptoms of diabetes?",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "question": "How is pneumonia diagnosed?",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "question": "What treatments are available for hypertension?",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "question": "Can you explain the difference between Type 1 and ",
+          "status": "failed",
+          "error": ""
+        },
+        {
+          "question": "What preventive measures can be taken against hear",
+          "status": "failed",
+          "error": ""
+        }
+      ]
+    },
+    {
+      "test": "error_handling",
+      "results": [
+        {
+          "test_case": "Empty report",
+          "status": "passed"
+        },
+        {
+          "test_case": "Invalid conversation ID",
+          "status": "passed"
+        },
+        {
+          "test_case": "Too long report",
+          "status": "passed"
+        }
+      ]
+    },
+    {
+      "test": "performance",
+      "single_request_time": 6.787120342254639,
+      "concurrent_time": 3.95497465133667,
+      "concurrent_success_rate": 0.0
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 9
+  }
+}
