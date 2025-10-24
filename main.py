@@ -283,14 +283,14 @@ async def lifespan(app: FastAPI):
         
         # Check if index exists
         if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' not found. Please run pinecone_setup.py first.")
+            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' not found. Please run ingest_pinecone.py first.")
             raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' not found")
         
         # Create the vector store
         vector_store = PineconeVectorStore(
             index_name=PINECONE_INDEX_NAME,
             embedding=embeddings,
-            text_key="disease"  # Field containing the text content
+            text_key="text_content"  # <-- ***THIS IS THE FIX***
         )
         
         # Check document count
@@ -300,7 +300,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Connected to Pinecone with {doc_count} documents")
         
         if doc_count == 0:
-            logger.error("Pinecone index shows 0 documents! There's a serious issue with the vector store.")
+            logger.error("Pinecone index shows 0 documents! Please run ingest_pinecone.py.")
         
         retriever = vector_store.as_retriever(search_kwargs={"k": 5})
         
