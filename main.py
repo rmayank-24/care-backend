@@ -336,7 +336,7 @@ async def lifespan(app: FastAPI):
         Your response should include:
         1. A primary diagnosis with the highest confidence
         2. Up to 3 differential diagnoses with lower confidence scores
-        3. For each diagnosis, provide comprehensive information including symptoms, diagnosis methods, tests, treatment, and prevention
+        3. For each diagnosis, provide comprehensive information including symptoms, diagnosis methods, tests, treatment, prevention, and suggested first-line medications.
 
         KNOWLEDGE BASE CONTEXT:
         {context}
@@ -405,6 +405,19 @@ async def lifespan(app: FastAPI):
                                 }
                             }
                         },
+                        "suggested_medications": {
+                            "type": "array",
+                            "description": "A list of suggested medications for the primary diagnosis. Only suggest common, first-line medications.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "drug_name": {"type": "string", "description": "The name of the medication (e.g., Amoxicillin, Ibuprofen)"},
+                                    "dosage": {"type": "string", "description": "The typical dosage (e.g., '500 mg', '2 tablets')"},
+                                    "frequency": {"type": "string", "description": "How often to take the medication (e.g., 'every 12 hours', 'as needed for pain')"}
+                                },
+                                "required": ["drug_name", "dosage", "frequency"]
+                            }
+                        },
                         "prevention_strategies": {
                             "type": "array", 
                             "items": {"type": "string"},
@@ -415,7 +428,7 @@ async def lifespan(app: FastAPI):
                             "description": "A clear explanation of why this diagnosis fits the patient presentation"
                         }
                     },
-                    "required": ["disease_name", "confidence_score", "summary", "clinical_presentation", "diagnostic_approach", "treatment_plan", "prevention_strategies", "relevance_explanation"]
+                    "required": ["disease_name", "confidence_score", "summary", "clinical_presentation", "diagnostic_approach", "treatment_plan", "suggested_medications", "prevention_strategies", "relevance_explanation"]
                 },
                 "differential_diagnoses": {
                     "type": "array",
@@ -903,4 +916,5 @@ async def debug_rag_chain(report_text: str = "Patient is a 72-year-old male with
     except Exception as e:
         logger.error(f"Error in debug RAG chain: {e}")
         return {"error": str(e)}
+
 
