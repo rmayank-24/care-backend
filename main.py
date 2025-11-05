@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 import uuid
 import pinecone
+from pinecone import ServerlessSpec  # Import the spec
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,15 +16,14 @@ from dotenv import load_dotenv
 
 # LangChain v0.2+ modular imports
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda, RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_community.tools import DuckDuckGoSearchRun, WikipediaQueryRun
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper, WikipediaAPIWrapper
 from langchain.agents import Tool
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain import hub
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -32,15 +32,15 @@ logger = logging.getLogger(__name__)
 
 # Define a local cache folder to ensure the model is saved consistently
 MODEL_CACHE_PATH = '.model_cache'
-# --- Use the correct index name ---
-PINECONE_INDEX_NAME = 'care-mini'
+# --- Use the correct index names ---
+DISEASE_INDEX_NAME = 'care-mini' 
+MED_INDEX_NAME = 'care-meds'
 
 # Create a directory for usage tracking if it doesn't exist
 USAGE_TRACKING_DIR = "usage_tracking"
 os.makedirs(USAGE_TRACKING_DIR, exist_ok=True)
 
 # --- APPLICATION STATE ---
-# Using a simple dictionary for app state as recommended for FastAPI
 app_state = {}
 
 # --- ONLINE RESOURCES FUNCTION ---
@@ -214,7 +214,7 @@ def get_usage_statistics():
     try:
         # For Pinecone, we need to use the index directly
         pc = pinecone.Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-        index = pc.Index(PINECONE_INDEX_NAME)
+        index = pc.Index(DISEASE_INDEX_NAME)
         stats = index.describe_index_stats()
         total_docs = stats.get('total_vector_count', 0)
     except:
@@ -235,15 +235,72 @@ def get_usage_statistics():
         "disease_usage_percentage": disease_usage_percentage
     }
 
+
+# --- HELPER FUNCTIONS ---
+def format_docs(docs: List[Any]) -> str:
+    """Format documents for the context, including their scores if available."""
+    formatted_docs = []
+    for d in docs:
+        score = d.metadata.get('score', 'N/A')
+        doc_string = f"[Score: {score}] {d.page_content}"
+        formatted_docs.append(doc_string)
+    return "\n\n---\n\n".join(formatted_docs)
+
+format_docs_lambda = RunnableLambda(format_docs)
+
+def create_tracked_retriever(vector_store: PineconeVectorStore, usage_key: str):
+    """Creates a retriever that tracks usage."""
+    retriever = vector_store.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.5, "k": 5}
+    )
+    
+    def tracked_retriever_func(query: str, config: RunnableConfig):
+        logger.info(f"Retrieving documents for {usage_key} with query: {query[:100]}...")
+        try:
+            # Use the score-based retriever
+            docs_with_scores = retriever.invoke(query)
+            
+            logger.info(f"Retrieved {len(docs_with_scores)} documents for {usage_key} meeting score threshold.")
+            
+            query_id = str(uuid.uuid4())
+            
+            # Process docs
+            processed_docs = []
+            if docs_with_scores and isinstance(docs_with_scores[0], tuple):
+                processed_docs = []
+                for doc, score in docs_with_scores:
+                    doc.metadata['score'] = score
+                    processed_docs.append(doc)
+            else:
+                processed_docs = docs_with_scores
+
+            # Store in app_state for the final response
+            if "retrieved_context" not in app_state:
+                app_state["retrieved_context"] = {}
+            app_state["retrieved_context"][usage_key] = processed_docs
+            
+            # Track usage for analytics (only for primary disease)
+            if usage_key == "disease":
+                app_state["last_query_id"] = query_id
+                track_document_usage(processed_docs, query_id)
+                
+            return processed_docs
+        except Exception as e:
+            logger.error(f"Error during document retrieval for {usage_key}: {e}")
+            return []
+    
+    return RunnableLambda(tracked_retriever_func)
+
+
 # --- FASTAPI LIFESPAN MANAGEMENT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown events for the FastAPI app."""
-    logger.info(f"Starting C.A.R.E. Backend with Pinecone index: '{PINECONE_INDEX_NAME}'...")
+    logger.info("Starting C.A.R.E. Backend...")
     
-    # Initialize components on startup
     try:
-        # 1. Initialize the LLM, explicitly passing the API key
+        # 1. Initialize the LLM
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             raise ValueError("GEMINI_API_KEY not found in .env file.")
@@ -256,87 +313,61 @@ async def lifespan(app: FastAPI):
 
         # 2. Initialize the embedding model
         logger.info(f"Loading embedding model from cache: {MODEL_CACHE_PATH}")
-        try:
-            # --- Use the correct "mini" model ---
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                cache_folder=MODEL_CACHE_PATH,
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
-            )
-            logger.info("Embedding model loaded successfully from cache.")
-        except Exception as e:
-            logger.error(f"Failed to load embedding model from cache: {e}")
-            logger.info("Attempting to load embedding model without cache...")
-            # --- Use the correct "mini" model ---
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
-            )
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            cache_folder=MODEL_CACHE_PATH,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
 
         # 3. Connect to Pinecone
-        logger.info(f"Connecting to Pinecone index: {PINECONE_INDEX_NAME}")
-        
+        logger.info(f"Connecting to Pinecone...")
         pinecone_api_key = os.environ.get("PINECONE_API_KEY")
         if not pinecone_api_key:
             raise ValueError("PINECONE_API_KEY not found in .env file.")
-            
         pc = pinecone.Pinecone(api_key=pinecone_api_key)
         
-        if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' not found. Please run ingest_pinecone.py first.")
-            raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' not found")
+        # 4. Connect to DISEASE Vector Store
+        logger.info(f"Connecting to DISEASE index: {DISEASE_INDEX_NAME}")
+        if DISEASE_INDEX_NAME not in pc.list_indexes().names():
+            logger.error(f"Disease index '{DISEASE_INDEX_NAME}' not found.")
+            raise ValueError(f"Pinecone index '{DISEASE_INDEX_NAME}' not found")
         
-        vector_store = PineconeVectorStore(
-            index_name=PINECONE_INDEX_NAME,
+        disease_vector_store = PineconeVectorStore(
+            index_name=DISEASE_INDEX_NAME,
             embedding=embeddings,
-            text_key="text_content"  # Use the correct text key from your ingestion script
+            text_key="text_content"
         )
-        
-        index = pc.Index(PINECONE_INDEX_NAME)
-        stats = index.describe_index_stats()
-        doc_count = stats.get('total_vector_count', 0)
-        
-        # --- Check dimension ---
-        # all-MiniLM-L6-v2 has a dimension of 384
-        if stats.get('dimension') != 384:
-            logger.error(f"FATAL: Pinecone index dimension is {stats.get('dimension')}, but model requires 384.")
-            logger.error("Please delete the index and recreate it with dimension 384, then run ingest_pinecone.py.")
-            raise ValueError(f"Incorrect Pinecone dimension: expected 384, got {stats.get('dimension')}")
-            
-        logger.info(f"Connected to Pinecone with {doc_count} documents")
-        
-        if doc_count == 0:
-            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' shows 0 documents! Please run ingest_pinecone.py.")
-        
-        # --- FIX 1: FILTER BY RELEVANCE SCORE ---
-        retriever = vector_store.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"score_threshold": 0.5, "k": 5}
-        )
-        
-        app_state["vector_store"] = vector_store
+        app_state["disease_vector_store"] = disease_vector_store
+        logger.info("Connected to DISEASE index.")
 
-        # 4. Define the improved RAG prompt template
-        # --- FIX 2: SOFTEN THE PROMPT ---
-        template = """
+        # 5. Connect to MEDICATION Vector Store
+        logger.info(f"Connecting to MEDICATION index: {MED_INDEX_NAME}")
+        if MED_INDEX_NAME not in pc.list_indexes().names():
+            logger.error(f"Medication index '{MED_INDEX_NAME}' not found.")
+            raise ValueError(f"Pinecone index '{MED_INDEX_NAME}' not found")
+
+        med_vector_store = PineconeVectorStore(
+            index_name=MED_INDEX_NAME,
+            embedding=embeddings,
+            text_key="text_content" 
+        )
+        app_state["med_vector_store"] = med_vector_store
+        logger.info("Connected to MEDICATION index.")
+
+        # 6. Define RAG Chain 1: Clinical Diagnosis
+        logger.info("Initializing Clinical Diagnosis RAG chain...")
+        
+        # --- Prompt for Chain 1 ---
+        diag_template = """
         You are a highly specialized medical AI, C.A.R.E. Your primary function is to analyze clinical reports and provide a comprehensive, evidence-based diagnosis in JSON format.
+        You MUST use the provided "KNOWLEDGE BASE CONTEXT" to ground your answer.
+        **Crucially, if a document in the context is clearly irrelevant to the PATIENT REPORT (e.g., context is about "Lead Poisoning" but the report is about "Food Poisoning"), you MUST ignore that specific document.**
+        Synthesize information from relevant context, do not copy phrases. Create coherent sentences.
+        Eliminate all redundancy. Ensure all lists contain distinct, meaningful items.
+        If context is missing information, use your medical knowledge to fill gaps.
 
-        CRITICAL INSTRUCTIONS:
-        1. You MUST use the provided "KNOWLEDGE BASE CONTEXT" to ground your answer.
-        2. **Crucially, if a document in the context is clearly irrelevant to the PATIENT REPORT (e.g., context is about "Lead Poisoning" but the report is about "Food Poisoning"), you MUST ignore that specific document and not use it in your analysis.**
-        3. Synthesize information from the relevant knowledge base context, avoiding direct copying of fragmented phrases.
-        4. Create complete, coherent sentences and well-structured paragraphs.
-        5. Eliminate redundancy and repetition in your response.
-        6. Organize information in a clinically relevant manner.
-        7. Ensure all lists contain distinct, meaningful items without duplication.
-        8. If the relevant context is missing information, use your medical knowledge to fill gaps.
-
-        Your response should include:
-        1. A primary diagnosis with the highest confidence
-        2. Up to 3 differential diagnoses with lower confidence scores
-        3. For each diagnosis, provide comprehensive information including symptoms, diagnosis methods, tests, treatment, prevention, and suggested first-line medications.
+        Your response MUST NOT include a "suggested_medications" section. You will only provide the diagnosis and treatment plan.
 
         KNOWLEDGE BASE CONTEXT:
         {context}
@@ -346,10 +377,10 @@ async def lifespan(app: FastAPI):
 
         JSON OUTPUT:
         """
-        prompt = ChatPromptTemplate.from_template(template)
-
-        # 5. Define the improved JSON output schema
-        output_schema = {
+        diag_prompt = ChatPromptTemplate.from_template(diag_template)
+        
+        # --- Schema for Chain 1 ---
+        diag_output_schema = {
             "title": "ClinicalAnalysis",
             "description": "Comprehensive analysis of a clinical report with disease information.",
             "type": "object",
@@ -363,72 +394,28 @@ async def lifespan(app: FastAPI):
                         "clinical_presentation": {
                             "type": "object",
                             "properties": {
-                                "common_symptoms": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "List of distinct symptoms without repetition"
-                                },
-                                "key_findings": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "Key clinical findings relevant to diagnosis"
-                                }
+                                "common_symptoms": {"type": "array", "items": {"type": "string"}},
+                                "key_findings": {"type": "array", "items": {"type": "string"}}
                             }
                         },
                         "diagnostic_approach": {
                             "type": "object",
                             "properties": {
-                                "initial_tests": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "First-line diagnostic tests"
-                                },
-                                "confirmatory_tests": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "Tests to confirm the diagnosis"
-                                }
+                                "initial_tests": {"type": "array", "items": {"type": "string"}},
+                                "confirmatory_tests": {"type": "array", "items": {"type": "string"}}
                             }
                         },
                         "treatment_plan": {
                             "type": "object",
                             "properties": {
-                                "first_line": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "Initial treatment approaches"
-                                },
-                                "advanced_options": {
-                                    "type": "array", 
-                                    "items": {"type": "string"},
-                                    "description": "Advanced or surgical options if needed"
-                                }
+                                "first_line": {"type": "array", "items": {"type": "string"}},
+                                "advanced_options": {"type": "array", "items": {"type": "string"}}
                             }
                         },
-                        "suggested_medications": {
-                            "type": "array",
-                            "description": "A list of suggested medications for the primary diagnosis. Only suggest common, first-line medications.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "drug_name": {"type": "string", "description": "The name of the medication (e.g., Amoxicillin, Ibuprofen)"},
-                                    "dosage": {"type": "string", "description": "The typical dosage (e.g., '500 mg', '2 tablets')"},
-                                    "frequency": {"type": "string", "description": "How often to take the medication (e.g., 'every 12 hours', 'as needed for pain')"}
-                                },
-                                "required": ["drug_name", "dosage", "frequency"]
-                            }
-                        },
-                        "prevention_strategies": {
-                            "type": "array", 
-                            "items": {"type": "string"},
-                            "description": "Evidence-based prevention strategies"
-                        },
-                        "relevance_explanation": {
-                            "type": "string", 
-                            "description": "A clear explanation of why this diagnosis fits the patient presentation"
-                        }
+                        "prevention_strategies": {"type": "array", "items": {"type": "string"}},
+                        "relevance_explanation": {"type": "string", "description": "Explanation of why this diagnosis fits the patient"}
                     },
-                    "required": ["disease_name", "confidence_score", "summary", "clinical_presentation", "diagnostic_approach", "treatment_plan", "suggested_medications", "prevention_strategies", "relevance_explanation"]
+                    "required": ["disease_name", "confidence_score", "summary", "clinical_presentation", "diagnostic_approach", "treatment_plan", "prevention_strategies", "relevance_explanation"]
                 },
                 "differential_diagnoses": {
                     "type": "array",
@@ -436,103 +423,102 @@ async def lifespan(app: FastAPI):
                         "type": "object",
                         "properties": {
                             "disease_name": {"type": "string"},
-                            "confidence_score": {"type": "number", "description": "A score from 0.0 to 1.0"},
-                            "summary": {"type": "string", "description": "A concise, well-written paragraph describing the condition"},
-                            "key_symptoms": {
-                                "type": "array", 
-                                "items": {"type": "string"},
-                                "description": "Key symptoms that differentiate this condition"
-                            },
-                            "diagnostic_tests": {
-                                "type": "array", 
-                                "items": {"type": "string"},
-                                "description": "Tests to confirm or rule out this diagnosis"
-                            },
-                            "treatment_approach": {
-                                "type": "array", 
-                                "items": {"type": "string"},
-                                "description": "Treatment approach if this diagnosis is confirmed"
-                            },
-                            "relevance_explanation": {
-                                "type": "string", 
-                                "description": "Explanation of why this diagnosis should be considered"
-                            }
+                            "confidence_score": {"type": "number"},
+                            "summary": {"type": "string"},
+                            "key_symptoms": {"type": "array", "items": {"type": "string"}},
+                            "diagnostic_tests": {"type": "array", "items": {"type": "string"}},
+                            "treatment_approach": {"type": "array", "items": {"type": "string"}},
+                            "relevance_explanation": {"type": "string"}
                         },
                         "required": ["disease_name", "confidence_score", "summary", "key_symptoms", "diagnostic_tests", "treatment_approach", "relevance_explanation"]
                     }
                 },
-                "clinical_recommendations": {
-                    "type": "array", 
-                    "items": {"type": "string"},
-                    "description": "Specific, actionable recommendations for this patient"
-                }
+                "clinical_recommendations": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["primary_diagnosis", "differential_diagnoses", "clinical_recommendations"]
         }
-
-        # 6. Chain it all together
-        structured_llm = llm.with_structured_output(output_schema)
         
-        # Create a RunnableLambda for the format_docs function
-        def format_docs(docs: List[Any]) -> str:
-            """Format documents for the context, including their scores if available."""
-            formatted_docs = []
-            for d in docs:
-                score = d.metadata.get('score', 'N/A')
-                doc_string = f"[Score: {score}] {d.page_content}"
-                formatted_docs.append(doc_string)
-            return "\n\n---\n\n".join(formatted_docs)
-
-        format_docs_lambda = RunnableLambda(format_docs)
-
-        def tracked_retriever_func(query):
-            logger.info(f"Retrieving documents for query: {query[:100]}...")
-            try:
-                # Use the score-based retriever
-                docs_with_scores = retriever.invoke(query)
-                
-                logger.info(f"Retrieved {len(docs_with_scores)} documents meeting score threshold.")
-                
-                query_id = str(uuid.uuid4())
-                app_state["last_query_id"] = query_id
-                
-                # Process docs (handles if retriever returns tuples or just docs)
-                processed_docs = []
-                if docs_with_scores and isinstance(docs_with_scores[0], tuple):
-                    # Handle if retriever returns (Document, score) tuples
-                    processed_docs = []
-                    for doc, score in docs_with_scores:
-                        doc.metadata['score'] = score
-                        processed_docs.append(doc)
-                else:
-                    # Handle if retriever returns List[Document] (score should be in metadata)
-                    processed_docs = docs_with_scores
-
-                app_state["last_retrieved_docs"] = processed_docs
-                track_document_usage(processed_docs, query_id)
-                return processed_docs
-            except Exception as e:
-                logger.error(f"Error during document retrieval: {e}")
-                return []
+        structured_diag_llm = llm.with_structured_output(diag_output_schema)
         
-        tracked_retriever_lambda = RunnableLambda(tracked_retriever_func)
+        disease_retriever = create_tracked_retriever(disease_vector_store, "disease")
 
-        rag_chain = (
+        app_state["diag_rag_chain"] = (
             RunnableParallel(
                 {
-                    "context": tracked_retriever_lambda | format_docs_lambda,
+                    "context": disease_retriever | format_docs_lambda,
                     "report": RunnablePassthrough()
                 }
             )
-            | prompt
-            | structured_llm
+            | diag_prompt
+            | structured_diag_llm
         )
+        logger.info("Clinical Diagnosis RAG chain initialized successfully!")
+
+        # 7. Define RAG Chain 2: Medication Suggestion
+        logger.info("Initializing Medication Suggestion RAG chain...")
+
+        # --- Prompt for Chain 2 ---
+        med_template = """
+        You are a clinical pharmacologist AI. Your task is to suggest first-line medications for a given disease, based on a KNOWLEDGE BASE of drug information.
         
-        app_state["rag_chain"] = rag_chain
-        logger.info("LangChain RAG chain initialized successfully!")
+        Analyze the "KNOWLEDGE BASE CONTEXT" and the "DISEASE NAME".
+        You must only suggest relevant medications from the context.
+        Filter out any irrelevant drugs (e.g., homeopathic remedies, sanitizers) and focus on common, appropriate prescription or OTC drugs.
+        Provide up to 5 distinct medication suggestions.
+
+        KNOWLEDGE BASE CONTEXT:
+        {context}
+
+        DISEASE NAME:
+        {disease_name}
+
+        JSON OUTPUT:
+        """
+        med_prompt = ChatPromptTemplate.from_template(med_template)
+        
+        # --- Schema for Chain 2 ---
+        med_output_schema = {
+            "title": "MedicationSuggestions",
+            "description": "A list of suggested medications for a given disease.",
+            "type": "object",
+            "properties": {
+                "suggested_medications": {
+                    "type": "array",
+                    "description": "A list of suggested medications for the primary diagnosis.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "drug_name": {"type": "string", "description": "The generic or brand name (e.g., Amoxicillin, Ibuprofen)"},
+                            "dosage": {"type": "string", "description": "A typical dosage (e.g., '500 mg', '2 tablets')"},
+                            "frequency": {"type": "string", "description": "How often to take it (e.g., 'every 12 hours', 'as needed')"}
+                        },
+                        "required": ["drug_name", "dosage", "frequency"]
+                    }
+                }
+            },
+            "required": ["suggested_medications"]
+        }
+        
+        structured_med_llm = llm.with_structured_output(med_output_schema)
+        
+        med_retriever = create_tracked_retriever(med_vector_store, "medication")
+        
+        app_state["med_rag_chain"] = (
+            RunnableParallel(
+                {
+                    "context": med_retriever | format_docs_lambda,
+                    "disease_name": RunnablePassthrough()
+                }
+            )
+            | med_prompt
+            | structured_med_llm
+        )
+        logger.info("Medication Suggestion RAG chain initialized successfully!")
+        
+        logger.info("All chains initialized. Application startup complete.")
 
     except Exception as e:
-        logger.error(f"Failed to initialize RAG chain: {e}", exc_info=True)
+        logger.error(f"Failed to initialize RAG chains: {e}", exc_info=True)
     
     yield
     
@@ -550,7 +536,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://emrpro.netlify.app","https://new-emr-pqlz.onrender.com", "http://localhost:3000"],
+    allow_origins=[
+        "https.emrpro.netlify.app",
+        "https://emr-frontend1.onrender.com", 
+        "http://localhost:3000", 
+        "http://localhost:8501",
+        "https://new-emr-pqlz.onrender.com"  # <-- ADDED
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -564,114 +556,92 @@ class ResourceRequest(BaseModel):
     disease_name: str = Field(..., description="The name of the disease to search for resources")
 
 # --- API ENDPOINTS ---
-@app.post("/api/v1/analyze")
-async def analyze_report(request: ReportRequest):
-    """
-    Analyzes a clinical report using the RAG pipeline and returns a structured JSON diagnosis.
-    """
-    if "rag_chain" not in app_state:
-        raise HTTPException(status_code=503, detail="RAG chain is not available. The service might be starting up or has encountered an error.")
-    
-    try:
-        logger.info("Invoking RAG chain for analysis...")
-        rag_chain = app_state["rag_chain"]
-        response = await rag_chain.ainvoke(request.report_text)
-        logger.info("Successfully received response from RAG chain.")
-        
-        query_id = app_state.get("last_query_id", "unknown")
-        retrieved_docs = app_state.get("last_retrieved_docs", [])
-        
-        result = {
-            "analysis": response,
-            "query_id": query_id,
-            "retrieved_context": [
-                {
-                    "page_content": doc.page_content,
-                    "metadata": doc.metadata
-                } for doc in retrieved_docs
-            ]
-        }
-        
-        return result
-    except Exception as e:
-        logger.error(f"Error during RAG chain invocation: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred while processing the report.")
 
 @app.post("/api/v1/clinical-analysis")
 async def clinical_analysis(request: ReportRequest):
     """
-    Analyzes a clinical report and returns a comprehensive structured diagnosis.
-    This endpoint is optimized for frontend integration.
+    Analyzes a clinical report using the new "chain of chains" logic.
     """
-    if "rag_chain" not in app_state:
-        raise HTTPException(status_code=503, detail="RAG chain is not available. The service might be starting up or has encountered an error.")
+    diag_chain = app_state.get("diag_rag_chain")
+    med_chain = app_state.get("med_rag_chain")
+    
+    if not diag_chain or not med_chain:
+        raise HTTPException(status_code=503, detail="RAG chains are not available. The service might be starting up or has encountered an error.")
+    
+    # Clear any context from previous calls
+    app_state["retrieved_context"] = {}
     
     try:
-        logger.info("Invoking RAG chain for clinical analysis...")
-        rag_chain = app_state["rag_chain"]
-        response = await rag_chain.ainvoke(request.report_text)
-        logger.info(f"Response type: {type(response)}")
-        logger.info(f"Response: {response}")
-        
-        # Handle the response which might be a list or dictionary
-        if isinstance(response, list):
-            logger.info("Response is a list, attempting to extract data...")
-            if len(response) > 0:
-                # Check if the list contains the old agent format
-                if 'args' in response[0] and 'type' in response[0]:
-                    logger.warning("Old agent format detected! Extracting from 'args'.")
-                    response_data = response[0].get('args', {})
-                else:
-                    response_data = response[0] if isinstance(response[0], dict) else {}
-                logger.info(f"Extracted data from list: {response_data}")
-            else:
-                logger.info("Empty list received, using empty dict")
-                response_data = {}
-        elif isinstance(response, dict):
-            response_data = response
+        # --- Step 1: Run Diagnosis Chain ---
+        logger.info("Invoking Diagnosis RAG chain...")
+        diag_response = await diag_chain.ainvoke(request.report_text)
+        logger.info("Diagnosis chain complete.")
+
+        # --- FIX: Handle list-based (agent) response ---
+        if isinstance(diag_response, list) and len(diag_response) > 0:
+            logger.info("Response is a list, attempting to extract 'args'.")
+            diag_response_data = diag_response[0].get('args', diag_response[0])
+        elif isinstance(diag_response, dict):
+            diag_response_data = diag_response
         else:
-            logger.error(f"Unexpected response type: {type(response)}. Using empty dict.")
-            response_data = {}
+            logger.error(f"Unexpected diagnosis response type: {type(diag_response)}")
+            raise HTTPException(status_code=500, detail="Failed to get a valid diagnosis from the AI model.")
         
-        # Ensure we have the required fields
-        if not response_data or "primary_diagnosis" not in response_data:
-            logger.warning("Response data is empty or missing 'primary_diagnosis'. Creating default error response.")
-            response_data = {
-                "primary_diagnosis": {
-                    "disease_name": "Unknown",
-                    "confidence_score": 0.0,
-                    "summary": "Unable to determine diagnosis. The RAG chain may have returned an unexpected format.",
-                    "clinical_presentation": {
-                        "common_symptoms": [],
-                        "key_findings": []
-                    },
-                    "diagnostic_approach": {
-                        "initial_tests": [],
-                        "confirmatory_tests": []
-                    },
-                    "treatment_plan": {
-                        "first_line": [],
-                        "advanced_options": []
-                    },
-                    "prevention_strategies": [],
-                    "relevance_explanation": "No relevant information found or an error occurred during processing."
-                },
-                "differential_diagnoses": [],
-                "clinical_recommendations": ["Please consult with a healthcare professional for proper diagnosis"]
-            }
+        if not diag_response_data or "primary_diagnosis" not in diag_response_data:
+            logger.error(f"Invalid diagnosis data: {diag_response_data}")
+            raise HTTPException(status_code=500, detail="Failed to get a valid diagnosis from the AI model.")
+            
+        primary_disease = diag_response_data["primary_diagnosis"].get("disease_name", "Unknown")
         
+        # --- Step 2: Run Medication Chain ---
+        logger.info(f"Invoking Medication RAG chain for: {primary_disease}")
+        med_response = await med_chain.ainvoke(primary_disease)
+        logger.info("Medication chain complete.")
+        
+        # --- FIX: Handle list-based (agent) response for meds ---
+        if isinstance(med_response, list) and len(med_response) > 0:
+            logger.info("Medication response is a list, attempting to extract 'args'.")
+            med_response_data = med_response[0].get('args', med_response[0])
+        elif isinstance(med_response, dict):
+            med_response_data = med_response
+        else:
+            logger.warning(f"Unexpected medication response type: {type(med_response)}")
+            med_response_data = {"suggested_medications": []}
+            
+        if not med_response_data:
+            logger.warning("Medication chain returned empty data.")
+            med_response_data = {"suggested_medications": []}
+            
+        # --- Step 3: Combine Results ---
+        logger.info("Combining diagnosis and medication results...")
+        
+        # Combine all data into the final structured response
+        final_data = {
+            **diag_response_data,  # Add all fields from diagnosis
+            "suggested_medications": med_response_data.get("suggested_medications", []) # Add the new field
+        }
+        
+        # Retrieve the context documents stored in app_state
+        disease_docs = app_state.get("retrieved_context", {}).get("disease", [])
+        med_docs = app_state.get("retrieved_context", {}).get("medication", [])
+
         result = {
             "success": True,
             "data": {
-                "primary_diagnosis": response_data.get("primary_diagnosis", {}),
-                "differential_diagnoses": response_data.get("differential_diagnoses", []),
-                "clinical_recommendations": response_data.get("clinical_recommendations", []),
+                **final_data, # Spread the combined data
                 "knowledge_base_sources": [
                     {
                         "disease": doc.metadata.get("disease", "Unknown"),
                         "source_url": doc.metadata.get("source_url", ""),
-                        "score": doc.metadata.get("score", "N/A") # Add score here
-                    } for doc in app_state.get("last_retrieved_docs", [])
+                        "score": doc.metadata.get("score", "N/A")
+                    } for doc in disease_docs
+                ],
+                "medication_sources": [
+                    {
+                        "brand_name": doc.metadata.get("brand_name", "Unknown"),
+                        "generic_name": doc.metadata.get("generic_name", "Unknown"),
+                        "score": doc.metadata.get("score", "N/A")
+                    } for doc in med_docs
                 ]
             },
             "metadata": {
@@ -681,9 +651,11 @@ async def clinical_analysis(request: ReportRequest):
         }
         
         return result
+        
     except Exception as e:
-        logger.error(f"Error during clinical analysis: {e}", exc_info=True)
+        logger.error(f"Error during 'chain of chains' invocation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred while processing the report.")
+
 
 @app.post("/api/v1/online-resources")
 async def get_online_resources(request: ResourceRequest):
@@ -719,10 +691,10 @@ async def get_online_resources(request: ResourceRequest):
 async def analyze_file(file: UploadFile = File(...)):
     """
     Analyzes a clinical report from an uploaded file (PDF or image).
-    Extracts text from the file and processes it through the RAG pipeline.
+    Extracts text and calls the main /clinical-analysis endpoint.
     """
-    if "rag_chain" not in app_state:
-        raise HTTPException(status_code=503, detail="RAG chain is not available. The service might be starting up or has encountered an error.")
+    if "diag_rag_chain" not in app_state:
+        raise HTTPException(status_code=503, detail="RAG chain is not available.")
     
     file_type = file.content_type
     if file_type not in ["application/pdf", "image/png", "image/jpeg", "image/jpg", "image/tiff"]:
@@ -750,50 +722,21 @@ async def analyze_file(file: UploadFile = File(...)):
                 extracted_text = pytesseract.image_to_string(image)
             
             if not extracted_text or len(extracted_text.strip()) < 20:
-                raise HTTPException(status_code=400, detail="Could not extract sufficient text from the uploaded file. Please ensure the file contains readable text.")
+                raise HTTPException(status_code=400, detail="Could not extract sufficient text from the file.")
             
-            logger.info("Invoking RAG chain for file analysis...")
-            rag_chain = app_state["rag_chain"]
-            response = await rag_chain.ainvoke(extracted_text)
-            logger.info("Successfully received response from RAG chain.")
+            logger.info("File processed, calling /clinical-analysis endpoint...")
             
-            # Handle the response (which should be a dict)
-            if isinstance(response, dict):
-                response_data = response
-            elif isinstance(response, list) and len(response) > 0:
-                 # Handle fallback for old agent format
-                if 'args' in response[0] and 'type' in response[0]:
-                    response_data = response[0].get('args', {})
-                else:
-                    response_data = response[0]
-            else:
-                response_data = {}
-
-            query_id = app_state.get("last_query_id", "unknown")
-            retrieved_docs = app_state.get("last_retrieved_docs", [])
+            # --- THIS IS THE FIX ---
+            # Instead of re-running the chain, just call the main endpoint
+            # This ensures the full "chain of chains" logic is applied
+            analysis_request = ReportRequest(report_text=extracted_text)
+            response_data = await clinical_analysis(analysis_request)
             
-            result = {
-                "success": True,
-                "data": {
-                    "primary_diagnosis": response_data.get("primary_diagnosis", {}),
-                    "differential_diagnoses": response_data.get("differential_diagnoses", []),
-                    "clinical_recommendations": response_data.get("clinical_recommendations", []),
-                    "knowledge_base_sources": [
-                        {
-                            "disease": doc.metadata.get("disease", "Unknown"),
-                            "source_url": doc.metadata.get("source_url", ""),
-                            "score": doc.metadata.get("score", "N/A") # Add score here
-                        } for doc in retrieved_docs
-                    ]
-                },
-                "metadata": {
-                    "query_id": query_id,
-                    "timestamp": datetime.now().isoformat(),
-                    "extracted_text": extracted_text
-                }
-            }
+            # Add extracted text to the response metadata
+            if isinstance(response_data, dict) and "metadata" in response_data:
+                 response_data["metadata"]["extracted_text"] = extracted_text
             
-            return result
+            return response_data
             
         except Exception as e:
             logger.error(f"Error during file analysis: {e}", exc_info=True)
@@ -826,12 +769,13 @@ async def get_recent_queries(limit: int = 10):
     
     return {"recent_queries": recent_queries}
 
-@app.get("/api/v1/debug/vector-store")
-async def debug_vector_store():
-    """Debug endpoint to check the vector store."""
+# --- DEBUG ENDPOINTS ---
+
+def get_pinecone_stats(index_name: str):
+    """Helper function to get stats for a Pinecone index."""
     try:
         pc = pinecone.Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-        index = pc.Index(PINECONE_INDEX_NAME)
+        index = pc.Index(index_name)
         stats = index.describe_index_stats()
 
         serializable_stats = {}
@@ -849,33 +793,21 @@ async def debug_vector_store():
                     if isinstance(vector_count, (int, float)):
                         namespace_info[ns_name] = {"vector_count": vector_count}
             serializable_stats["namespaces"] = namespace_info
-
-        sample_docs = []
-        if stats.get('total_vector_count', 0) > 0:
-            sample_docs = [{"info": "Pinecone doesn't support random sampling without IDs"}]
-
-        return {
-            "pinecone_stats": serializable_stats,
-            "sample_documents": sample_docs
-        }
-    except Exception as e:
-        logger.error(f"Error debugging vector store: {e}")
-        return {"error": str(e)}
-
-@app.post("/api/v1/debug/retrieval")
-async def debug_retrieval(query: str = "chest pain"):
-    """Debug endpoint to test document retrieval."""
-    try:
-        vector_store = app_state.get("vector_store")
-        if not vector_store:
-            return {"error": "Vector store not initialized"}
         
-        # --- FIX: Use the same score threshold logic for debugging ---
+        return serializable_stats
+        
+    except Exception as e:
+        logger.error(f"Error debugging vector store {index_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def debug_retrieval_helper(vector_store: PineconeVectorStore, query: str):
+    """Helper function to test retrieval for a given vector store."""
+    try:
         retriever = vector_store.as_retriever(
             search_type="similarity_score_threshold",
             search_kwargs={"score_threshold": 0.5, "k": 5}
         )
-        docs = retriever.invoke(query)
+        docs = await retriever.ainvoke(query)
         
         result = {
             "query": query,
@@ -897,24 +829,32 @@ async def debug_retrieval(query: str = "chest pain"):
         return result
     except Exception as e:
         logger.error(f"Error in debug retrieval: {e}")
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/v1/debug/rag-chain")
-async def debug_rag_chain(report_text: str = "Patient is a 72-year-old male with atrial fibrillation and hypertension who was found by his family with sudden onset of right-sided weakness and speech difficulty."):
-    """Debug endpoint to test the RAG chain directly."""
-    try:
-        if "rag_chain" not in app_state:
-            return {"error": "RAG chain not initialized"}
-        
-        rag_chain = app_state["rag_chain"]
-        response = await rag_chain.ainvoke(report_text)
-        
-        return {
-            "response_type": str(type(response)),
-            "response_content": response
-        }
-    except Exception as e:
-        logger.error(f"Error in debug RAG chain: {e}")
-        return {"error": str(e)}
+# --- Disease Debug Endpoints ---
+@app.get("/api/v1/debug/vector-store")
+async def debug_vector_store():
+    """Debug endpoint to check the DISEASE vector store."""
+    return get_pinecone_stats(DISEASE_INDEX_NAME)
 
+@app.post("/api/v1/debug/retrieval")
+async def debug_retrieval(query: str = "chest pain"):
+    """Debug endpoint to test DISEASE document retrieval."""
+    vector_store = app_state.get("disease_vector_store")
+    if not vector_store:
+        raise HTTPException(status_code=503, detail="Disease vector store not initialized")
+    return await debug_retrieval_helper(vector_store, query)
 
+# --- Medication Debug Endpoints ---
+@app.get("/api/v1/debug/vector-store-meds")
+async def debug_vector_store_meds():
+    """Debug endpoint to check the MEDICATION vector store."""
+    return get_pinecone_stats(MED_INDEX_NAME)
+
+@app.post("/api/v1/debug/retrieval-meds")
+async def debug_retrieval_meds(query: str = "medication for hypertension"):
+    """Debug endpoint to test MEDICATION document retrieval."""
+    vector_store = app_state.get("med_vector_store")
+    if not vector_store:
+        raise HTTPException(status_code=503, detail="Medication vector store not initialized")
+    return await debug_retrieval_helper(vector_store, query)
